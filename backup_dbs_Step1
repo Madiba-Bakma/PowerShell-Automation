@@ -1,0 +1,97 @@
+# ============================================================
+# Step 1 (PowerShell): Create per-database backup folders
+# - Creates: <BackupRoot>\<DBName>\
+# - Pulls DB list from SQL Server
+# - Optional include/exclude lists
+# ============================================================
+
+# ---- EDIT THESE ----
+$BackupRoot = "\\Sql01\mssql"      # or "\\FileServer\SqlBackups"
+$Instance   = "SQL01"          # e.g. "SERVER01" or "SERVER01\SQL2019"
+$IncludeCsv = "AdventureWorks2016,NORTHWND,AlwaysOn_Database1,LogShip_Database,Mirrior_Database,ShopDB"   # "" = all user DBs
+$ExcludeCsv = ""                         # e.g. "DBToSkip1,DBToSkip2"
+
+# If you also want to skip read-only/offline DBs (recommended)
+$SkipReadOnly = $true
+$SkipOffline  = $true
+# --------------------
+
+# Normalize path (remove trailing slash)
+$BackupRoot = $BackupRoot.TrimEnd('\','/')
+
+# Convert include/exclude CSV to arrays
+$include = @()
+if (![string]::IsNullOrWhiteSpace($IncludeCsv)) {
+    $include = $IncludeCsv.Split(",") | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" } | Select-Object -Unique
+}
+$exclude = @()
+if (![string]::IsNullOrWhiteSpace($ExcludeCsv)) {
+    $exclude = $ExcludeCsv.Split(",") | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" } | Select-Object -Unique
+}
+
+# Build SQL query for DB list
+# - Excludes system DBs (database_id > 4)
+# - Optionally filter offline/read-only
+$filters = @("database_id > 4")
+
+if ($SkipOffline)  { $filters += "state_desc = 'ONLINE'" }
+if ($SkipReadOnly) { $filters += "is_read_only = 0" }
+
+$query = @"
+SELECT name
+FROM sys.databases
+WHERE $( $filters -join " AND " )
+ORDER BY name;
+"@
+
+Write-Output "Backup root: $BackupRoot"
+Write-Output "Instance:    $Instance"
+Write-Output "Query:`n$query"
+
+# Ensure root exists
+if (!(Test-Path -LiteralPath $BackupRoot)) {
+    throw "Backup root path does not exist: $BackupRoot"
+}
+
+# Get databases (uses sqlcmd, available on most servers with SQL tools)
+$dbs = & sqlcmd -S $Instance -E -h -1 -W -Q $query
+
+if ($LASTEXITCODE -ne 0) {
+    throw "sqlcmd failed (exit code $LASTEXITCODE). Check instance name/auth and that sqlcmd is installed."
+}
+
+# Clean results
+$dbs = $dbs | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" }
+
+# Apply include/exclude filters in PowerShell (simple + clear)
+if ($include.Count -gt 0) {
+    $dbs = $dbs | Where-Object { $include -contains $_ }
+}
+if ($exclude.Count -gt 0) {
+    $dbs = $dbs | Where-Object { $exclude -notcontains $_ }
+}
+
+if ($dbs.Count -eq 0) {
+    Write-Output "No databases matched selection. Nothing to do."
+    exit 0
+}
+
+# Create per-db folders
+$created = 0
+$existing = 0
+
+foreach ($db in $dbs) {
+    $folder = Join-Path $BackupRoot $db
+
+    if (Test-Path -LiteralPath $folder) {
+        Write-Output "EXISTS : $folder"
+        $existing++
+    }
+    else {
+        New-Item -ItemType Directory -Path $folder -Force | Out-Null
+        Write-Output "CREATED: $folder"
+        $created++
+    }
+}
+
+Write-Output "Done. Created=$created, AlreadyExisted=$existing, Total=$($dbs.Count)"
